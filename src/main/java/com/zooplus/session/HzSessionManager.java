@@ -21,51 +21,30 @@ import java.beans.PropertyChangeListener;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.logging.Level;
 
 /**
  * Created by Igor Ivaniuk on 13.11.2015.
  */
 public class HzSessionManager implements Manager, Lifecycle {
 
-    private static final Logger log = LoggerFactory.getLogger(HzSessionManager.class)
+    private static final Logger log = LoggerFactory.getLogger(HzSessionManager.class);
 
     private Container container;
     private int maxInactiveInterval;
     private ThreadLocal<StandardSession> currentSession = new ThreadLocal<StandardSession>();
     private Serializer serializer;
+    private HzSessionTrackerValve trackerValve;
+    private HazelcastInstance hazelcastClient;
 
-    private IMap<Object, Object> sessions = HazelcastInstance
+
+    private IMap<String, Object> sessions;
 
     //Either 'kryo' or 'java'
     private String serializationStrategyClass = "com.zooplus.session.JavaSerializer";
-
-    public static String getHost() {
-        return host;
-    }
-
-    public static void setHost(String host) {
-        MongoManager.host = host;
-    }
-
-    public static int getPort() {
-        return port;
-    }
-
-    public static void setPort(int port) {
-        MongoManager.port = port;
-    }
-
-    public static String getDatabase() {
-        return database;
-    }
-
-    public static void setDatabase(String database) {
-        MongoManager.database = database;
-    }
 
     @Override
     public Container getContainer() {
@@ -238,7 +217,7 @@ public class HzSessionManager implements Manager, Lifecycle {
         return createEmptySession();
     }
 
-    public org.apache.catalina.Session createSession(java.lang.String sessionId) {
+    public org.apache.catalina.Session createSession(String sessionId) {
         StandardSession session = (HzSession) createEmptySession();
 
         log.debug("Created session with id " + session.getIdInternal() + " ( " + sessionId + ")");
@@ -251,7 +230,7 @@ public class HzSessionManager implements Manager, Lifecycle {
 
     public org.apache.catalina.Session[] findSessions() {
         try {
-            List<Session> sessions = new ArrayList<Session>();
+            List<Session> sessions = new ArrayList<>();
             for (String sessionId : keys()) {
                 sessions.add(loadSession(sessionId));
             }
@@ -263,14 +242,14 @@ public class HzSessionManager implements Manager, Lifecycle {
 
     protected org.apache.catalina.session.StandardSession getNewSession() {
         log.debug("getNewSession()");
-        return (MongoSession) createEmptySession();
+        return (HzSession) createEmptySession();
     }
 
     public void start() throws LifecycleException {
         for (Valve valve : getContainer().getPipeline().getValves()) {
-            if (valve instanceof MongoSessionTrackerValve) {
-                trackerValve = (MongoSessionTrackerValve) valve;
-                trackerValve.setMongoManager(this);
+            if (valve instanceof HzSessionTrackerValve) {
+                trackerValve = (HzSessionTrackerValve) valve;
+                trackerValve.setManager(this);
                 log.info("Attached to Mongo Tracker Valve");
                 break;
             }
@@ -278,7 +257,7 @@ public class HzSessionManager implements Manager, Lifecycle {
         try {
             initSerializer();
         } catch (ClassNotFoundException e) {
-            log.error(Level.SEVERE, "Unable to load serializer", e);
+            log.error("Unable to load serializer", e);
             throw new LifecycleException(e);
         } catch (InstantiationException e) {
             log.error("Unable to load serializer", e);
@@ -288,154 +267,67 @@ public class HzSessionManager implements Manager, Lifecycle {
             throw new LifecycleException(e);
         }
         log.info("Will expire sessions after " + getMaxInactiveInterval() + " seconds");
-        initDbConnection();
+        initSessionsCollection();
+    }
+
+    private void initSessionsCollection() throws LifecycleException {
+        ClientConfig clientConfig = null;
+        try {
+            clientConfig = new XmlClientConfigBuilder("hazelcast-client.xml").build();
+        } catch (IOException e) {
+            e.printStackTrace();
+            throw new LifecycleException("Error loading Hazelcast configuration", e);
+        }
+        hazelcastClient = HazelcastClient.newHazelcastClient(clientConfig);
+        sessions = hazelcastClient.getMap("sessions");
     }
 
     public void stop() throws LifecycleException {
-        mongo.close();
+        hazelcastClient.shutdown();
     }
 
     public Session findSession(String id) throws IOException {
         return loadSession(id);
     }
 
-    public void clear() throws IOException {
-        getCollection().drop();
-        getCollection().ensureIndex(new BasicDBObject("lastmodified", 1));
-    }
-
-    private DBCollection getCollection() throws IOException {
-        return db.getCollection("sessions");
-    }
-
-    public int getSize() throws IOException {
-        return (int) getCollection().count();
-    }
-
     public String[] keys() throws IOException {
 
-        BasicDBObject restrict = new BasicDBObject();
-        restrict.put("_id", 1);
-
-        DBCursor cursor = getCollection().find(new BasicDBObject(), restrict);
-
-        List<String> ret = new ArrayList<String>();
-
-        while (cursor.hasNext()) {
-            ret.add(cursor.next().get("").toString());
-        }
-
-        return ret.toArray(new String[ret.size()]);
+        return (String[]) sessions.keySet().toArray();
     }
 
 
     public Session loadSession(String id) throws IOException {
-
         if (id == null || id.length() == 0) {
             return createEmptySession();
         }
 
-        StandardSession session = currentSession.get();
-
-        if (session != null) {
-            if (id.equals(session.getId())) {
-                return session;
-            } else {
-                currentSession.remove();
-            }
-        }
-        try {
-            log.fine("Loading session " + id + " from Mongo");
-            BasicDBObject query = new BasicDBObject();
-            query.put("_id", id);
-
-            DBObject dbsession = getCollection().findOne(query);
-
-            if (dbsession == null) {
-                log.fine("Session " + id + " not found in Mongo");
-                StandardSession ret = getNewSession();
-                ret.setId(id);
-                currentSession.set(ret);
-                return ret;
-            }
-
-            byte[] data = (byte[]) dbsession.get("data");
-
-            session = (MongoSession) createEmptySession();
-            session.setId(id);
-            session.setManager(this);
-            serializer.deserializeInto(data, session);
-
-            session.setMaxInactiveInterval(-1);
-            session.access();
-            session.setValid(true);
-            session.setNew(false);
-
-            if (log.isLoggable(Level.FINE)) {
-                log.fine("Session Contents [" + session.getId() + "]:");
-                for (Object name : Collections.list(session.getAttributeNames())) {
-                    log.fine("  " + name);
-                }
-            }
-
-            log.fine("Loaded session id " + id);
+        if (sessions.containsKey(id)) {
+            StandardSession session = (StandardSession) sessions.get(id);
             currentSession.set(session);
             return session;
-        } catch (IOException e) {
-            log.severe(e.getMessage());
-            throw e;
-        } catch (ClassNotFoundException ex) {
-            log.error("Unable to deserialize session ", ex);
-            throw new IOException("Unable to deserializeInto session", ex);
+        } else {
+            return createEmptySession();
         }
     }
 
     public void save(Session session) throws IOException {
-        try {
-            log.fine("Saving session " + session + " into Mongo");
+        log.debug("Saving session " + session + " into Hazelcast");
 
-            StandardSession standardsession = (MongoSession) session;
+        StandardSession standardsession = (HzSession) session;
 
-            if (log.isLoggable(Level.FINE)) {
-                log.fine("Session Contents [" + session.getId() + "]:");
-                for (Object name : Collections.list(standardsession.getAttributeNames())) {
-                    log.fine("  " + name);
-                }
-            }
-
-            byte[] data = serializer.serializeFrom(standardsession);
-
-            BasicDBObject dbsession = new BasicDBObject();
-            dbsession.put("_id", standardsession.getId());
-            dbsession.put("data", data);
-            dbsession.put("lastmodified", System.currentTimeMillis());
-
-            BasicDBObject query = new BasicDBObject();
-            query.put("_id", standardsession.getIdInternal());
-            getCollection().update(query, dbsession, true, false);
-            log.fine("Updated session with id " + session.getIdInternal());
-        } catch (IOException e) {
-            log.severe(e.getMessage());
-            e.printStackTrace();
-            throw e;
-        } finally {
-            currentSession.remove();
-            log.fine("Session removed from ThreadLocal :" + session.getIdInternal());
+        log.debug("Session Contents [" + session.getId() + "]:");
+        for (Object name : Collections.list(standardsession.getAttributeNames())) {
+            log.debug("  " + name);
         }
+
+        sessions.put(standardsession.getId(), standardsession);
+        currentSession.remove();
+        log.debug("Session removed from ThreadLocal :" + session.getIdInternal());
+
     }
 
     public void remove(Session session) {
-        log.fine("Removing session ID : " + session.getId());
-        BasicDBObject query = new BasicDBObject();
-        query.put("_id", session.getId());
-
-        try {
-            getCollection().remove(query);
-        } catch (IOException e) {
-            log.error("Error removing session in Mongo Session Store", e);
-        } finally {
-            currentSession.remove();
-        }
+        sessions.remove(session.getId());
     }
 
     @Override
@@ -447,6 +339,15 @@ public class HzSessionManager implements Manager, Lifecycle {
         BasicDBObject query = new BasicDBObject();
 
         long olderThan = System.currentTimeMillis() - (getMaxInactiveInterval() * 1000);
+
+        for (Iterator<Map.Entry<String, Object>> it = sessions.entrySet().iterator(); it.hasNext(); ) {
+            Map.Entry<String, Object> entry = it.next();
+            StandardSession session = (StandardSession) entry.getValue();
+            if (session.)
+            if (entry.getKey().equals("test")) {
+                it.remove();
+            }
+        }
 
         log.fine("Looking for sessions less than for expiry in Mongo : " + olderThan);
 
